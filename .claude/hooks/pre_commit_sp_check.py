@@ -8,8 +8,75 @@ then checks the staged diff against known .claude/CODING_NOTES.md anti-patterns.
 import sys
 import json
 import re
+import shlex
 import shutil
 import subprocess
+
+
+# git global options that consume the following token as their argument
+_ARG_OPTIONS = frozenset({
+    "-C", "-c", "--exec-path", "--git-dir",
+    "--work-tree", "--namespace", "--super-prefix",
+    "--list-cmds",
+})
+_OPERATOR_CHARS = frozenset("();<>|&")
+
+
+def _command_segments(command: str) -> list:
+    """Split a shell command line into simple commands at &&, ||, ;, |, & and newlines.
+
+    Only the first git invocation used to be inspected, so `git add f && git commit` looked like a plain
+    `git add` and the staged-diff check silently never ran. Newlines are turned into `;` first because shlex
+    treats them as plain whitespace; inside quotes (a multi-line commit message) they stay part of one token.
+    """
+    lexer = shlex.shlex(command.replace("\n", " ; "), posix=True, punctuation_chars=True)
+    lexer.whitespace_split = True
+    segments, current = [], []
+    for tok in lexer:
+        if tok and all(ch in _OPERATOR_CHARS for ch in tok):
+            segments.append(current)
+            current = []
+        else:
+            current.append(tok)
+    segments.append(current)
+    return [seg for seg in segments if seg]
+
+
+def _segment_is_git_commit(tokens: list) -> bool:
+    try:
+        git_idx = next(i for i, t in enumerate(tokens) if t == "git" or t.endswith("/git"))
+    except StopIteration:
+        return False
+    i = git_idx + 1
+    while i < len(tokens):
+        tok = tokens[i]
+        if tok in _ARG_OPTIONS:
+            i += 2
+        elif tok.startswith("-"):
+            i += 1
+        else:
+            return tok == "commit"
+    return False
+
+
+def _is_git_commit_command(command: str) -> bool:
+    """Return True when any simple command in the line invokes the git commit subcommand."""
+    try:
+        segments = _command_segments(command)
+    except ValueError:
+        return bool(re.search(r"git\s+commit", command))
+    return any(_segment_is_git_commit(seg) for seg in segments)
+
+
+def _added_lines_by_file(diff: str) -> list:
+    """Return (path, added line) pairs from a unified diff, so checks can be limited to the right file types."""
+    pairs, path = [], ""
+    for line in diff.splitlines():
+        if line.startswith("+++ "):
+            path = line[4:].removeprefix("b/")
+        elif line.startswith("+"):
+            pairs.append((path, line))
+    return pairs
 
 
 def get_staged_diff() -> str:
@@ -37,15 +104,15 @@ def main():
     except json.JSONDecodeError:
         sys.exit(0)
 
-    # Only run on git commit commands
-    if not re.search(r"git\s+commit", command):
+    if not _is_git_commit_command(command):
         sys.exit(0)
 
     diff = get_staged_diff()
     if not diff:
         sys.exit(0)
 
-    added_lines = [line for line in diff.splitlines() if line.startswith("+") and not line.startswith("+++")]
+    added = _added_lines_by_file(diff)
+    added_lines = [line for _, line in added]  # line-only view used by the checks below
 
     warnings = []
 
@@ -54,8 +121,9 @@ def main():
     # ---------------------------------------------------------------
 
     # [2026-04-06] Broad except Exception
-    for line in added_lines:
-        if re.search(r"except\s+Exception\b", line):
+    # Python files only: docs that show the anti-pattern as an example must not trip it.
+    for path, line in added:
+        if path.endswith(".py") and re.search(r"except\s+Exception\b", line):
             warnings.append(
                 "Broad 'except Exception' detected — use specific exceptions "
                 "(e.g. OSError, AttributeError). [CODING_NOTES 2026-04-06]"
@@ -83,14 +151,18 @@ def main():
     # ---------------------------------------------------------------
 
     if warnings:
-        print()
-        print(f"Coding Notes Pre-commit Check — {len(warnings)} issue(s) found:")
-        for w in warnings:
-            print(f"  * {w}")
-        print()
-        print("Review .claude/CODING_NOTES.md before proceeding. Commit is NOT blocked — "
-              "fix on next commit if intentional.")
-        print()
+        message = (
+            f"Coding Notes Pre-commit Check — {len(warnings)} issue(s) found:\n"
+            + "\n".join(f"  * {w}" for w in warnings)
+            + "\n\nReview .claude/CODING_NOTES.md before proceeding. Commit is NOT blocked — "
+              "fix on next commit if intentional."
+        )
+        # Plain stdout from a PreToolUse hook is only logged. systemMessage shows the warning to the user;
+        # additionalContext puts it in front of Claude. Neither blocks the tool call (no permissionDecision).
+        print(json.dumps({
+            "systemMessage": message,
+            "hookSpecificOutput": {"hookEventName": "PreToolUse", "additionalContext": message},
+        }))
 
     sys.exit(0)
 
